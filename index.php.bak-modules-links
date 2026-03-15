@@ -1,0 +1,406 @@
+﻿<?php
+require_once __DIR__ . '/includes/functions.php';
+require_once __DIR__ . '/includes/auth.php';
+require_once __DIR__ . '/includes/feed.php';
+
+$settings = read_json('settings.json', []);
+$menu = sort_by_order(array_values(array_filter(read_json('menu.json', []), static function ($i) {
+    return ($i['active'] ?? true) !== false;
+})));
+$modules = sort_by_order(array_values(array_filter(read_json('modules.json', []), static function ($i) {
+    return ($i['active'] ?? true) !== false;
+})));
+$channels = read_json('channels.json', []);
+$videos = read_json('videos.json', []);
+$widgets = read_json('widgets.json', []);
+$articles = read_json('articles.json', []);
+$discord = read_json('discord.json', ['discordMessages' => [], 'discordForumThreads' => []]);
+$analytics = read_json('analytics.json', ['contentEvents' => []]);
+
+$feed = build_widget_feed($videos, $channels, $widgets, $articles, $modules, $discord, $analytics);
+
+$menuMap = [];
+foreach ($menu as $m) $menuMap[(string)$m['id']] = $m;
+$moduleMap = [];
+foreach ($modules as $m) $moduleMap[(string)$m['id']] = $m;
+$widgetMap = [];
+foreach ($feed as $w) $widgetMap[(string)$w['id']] = $w;
+
+$activeMenuId = $_GET['menu'] ?? ($menu[0]['id'] ?? '');
+$selectedWidgetId = $_GET['widget'] ?? '';
+$selectedVideoId = parse_youtube_id((string)($_GET['video'] ?? ''));
+
+$activeMenu = $menuMap[$activeMenuId] ?? ($menu[0] ?? null);
+$centerModule = $activeMenu ? ($moduleMap[(string)($activeMenu['moduleId'] ?? '')] ?? null) : null;
+
+if ($selectedWidgetId !== '' && isset($widgetMap[$selectedWidgetId])) {
+    $centerModule = [
+        'id' => 'widget-' . $selectedWidgetId,
+        'type' => 'widget_feed',
+        'config' => ['widgetId' => $selectedWidgetId, 'title' => $widgetMap[$selectedWidgetId]['title'] ?? 'Widget']
+    ];
+}
+
+$rightTiles = array_values(array_filter($feed, static function ($w) {
+    return (string)($w['placement'] ?? 'right_panel') === 'right_tiles';
+}));
+$rightPanel = array_values(array_filter($feed, static function ($w) {
+    return (string)($w['placement'] ?? 'right_panel') === 'right_panel';
+}));
+
+function pick_preview(array $widget): array {
+    $fallback = app_url('assets/placeholder.jpg');
+    if (($widget['type'] ?? '') === 'film' && !empty($widget['videos'][0])) {
+        return [
+            'image' => $widget['videos'][0]['thumbnail'] ?? $fallback,
+            'subtitle' => $widget['videos'][0]['title'] ?? ($widget['title'] ?? 'Widget')
+        ];
+    }
+    if (($widget['type'] ?? '') === 'gallery' && !empty($widget['gallery']['images'][0])) {
+        $img = $widget['gallery']['images'][0];
+        return ['image' => $img['thumbnailPath'] ?? ($img['filePath'] ?? $fallback), 'subtitle' => $img['title'] ?? ($widget['title'] ?? 'Galeria')];
+    }
+    if (($widget['type'] ?? '') === 'article' && !empty($widget['articles'][0])) {
+        $a = $widget['articles'][0];
+        return ['image' => $a['thumbnail'] ?? $fallback, 'subtitle' => $a['title'] ?? ($widget['title'] ?? 'Artykul')];
+    }
+    return ['image' => $widget['thumbnail'] ?? $fallback, 'subtitle' => $widget['title'] ?? 'Widget'];
+}
+
+function module_videos(array $module, array $videos): array {
+    $type = (string)($module['type'] ?? 'custom_text');
+    $limit = (int)($module['config']['limit'] ?? 12);
+    $limit = max(1, min(24, $limit));
+
+    if ($type === 'latest_videos') {
+        $copy = $videos;
+        usort($copy, static function ($a, $b) {
+            return strtotime((string)($b['publishedAt'] ?? '')) <=> strtotime((string)($a['publishedAt'] ?? ''));
+        });
+        return array_slice($copy, 0, $limit);
+    }
+
+    if ($type === 'trending_videos') {
+        $copy = $videos;
+        usort($copy, static function ($a, $b) {
+            return (int)($b['views'] ?? 0) <=> (int)($a['views'] ?? 0);
+        });
+        return array_slice($copy, 0, $limit);
+    }
+
+    return [];
+}
+function compute_trends_fallback(array $analytics, int $limit = 5): array {
+    $events = is_array($analytics['contentEvents'] ?? null) ? $analytics['contentEvents'] : [];
+    $stats = [];
+    foreach ($events as $e) {
+        $et = (string)($e['eventType'] ?? '');
+        if (!in_array($et, ['click', 'open', 'expand', 'play', 'section_open'], true)) {
+            continue;
+        }
+        $ctype = (string)($e['contentType'] ?? 'unknown');
+        $cid = (string)($e['contentId'] ?? '');
+        $key = $ctype . ':' . $cid;
+        if (!isset($stats[$key])) {
+            $stats[$key] = [
+                'id' => $key,
+                'contentType' => $ctype,
+                'contentId' => $cid,
+                'label' => (string)($e['metadata']['label'] ?? ($cid !== '' ? $cid : $ctype)),
+                'clicks' => 0,
+                'lastActivity' => ''
+            ];
+        }
+        $stats[$key]['clicks']++;
+        $createdAt = (string)($e['createdAt'] ?? '');
+        if ($createdAt > (string)$stats[$key]['lastActivity']) {
+            $stats[$key]['lastActivity'] = $createdAt;
+        }
+    }
+
+    $rows = array_values($stats);
+    usort($rows, static function ($a, $b) {
+        $cmp = (int)($b['clicks'] ?? 0) <=> (int)($a['clicks'] ?? 0);
+        if ($cmp !== 0) return $cmp;
+        return strcmp((string)($b['lastActivity'] ?? ''), (string)($a['lastActivity'] ?? ''));
+    });
+
+    return array_slice($rows, 0, max(1, min(10, $limit)));
+}
+
+$user = current_user();
+$activeTemplate = normalize_template_name((string)($settings['template'] ?? 'black_media'));
+$siteName = (string)($settings['siteName'] ?? 'YT Alternative PHP');
+$texts = $settings['texts'] ?? [];
+$logoTitle = (string)($texts['logoTitle'] ?? $siteName);
+$logoSubtitle = (string)($texts['logoSubtitle'] ?? 'Panel wlasnego feedu');
+$homeTitle = (string)($texts['homeTitle'] ?? 'Centrum filmow');
+$homeSubtitle = (string)($texts['homeSubtitle'] ?? 'Kliknij pozycje menu i przegladaj tresci.');
+$logoPath = (string)($settings['logoPath'] ?? '');
+if ($logoPath !== '' && strpos($logoPath, '/uploads/') === 0) {
+    $logoPath = app_url(ltrim($logoPath, '/'));
+} elseif ($logoPath !== '') {
+    $logoPath = app_url('uploads/' . ltrim(basename($logoPath), '/'));
+}
+
+$videoById = [];
+foreach ($videos as $v) {
+    if (!empty($v['videoId'])) $videoById[(string)$v['videoId']] = $v;
+}
+
+$selectedVideo = $selectedVideoId !== '' && isset($videoById[$selectedVideoId]) ? $videoById[$selectedVideoId] : null;
+$baseIndexUrl = app_url('index.php');
+$social = is_array($settings['social'] ?? null) ? $settings['social'] : [];
+$showSocialInIndex = (bool)($social['showOnIndex'] ?? false);
+$socialMode = (string)($social['mode'] ?? 'simple');
+$facebookUrl = trim((string)($social['facebookUrl'] ?? ''));
+$instagramUrl = trim((string)($social['instagramUrl'] ?? ''));
+?>
+<!doctype html>
+<html lang="pl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title><?= h($siteName) ?></title>
+  <?php if ($activeTemplate === 'black_media'): ?>
+    <link rel="stylesheet" href="<?= h(app_url('themes/black_media/templatemo_style.css')) ?>">
+    <link rel="stylesheet" href="<?= h(app_url('themes/black_media/black_media_dynamic.css')) ?>">
+    <style>
+      #templatemo_search_box .admin-btn { margin-top: 6px; margin-left: 15px; display: inline-block; padding: 3px 8px; border: 1px solid #5a5a5a; color: #fff; text-decoration: none; font-size: 12px; }
+      #templatemo_search_box .admin-btn:hover { color: #ccff00; }
+      .php-video-grid { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 10px; margin: 0 25px 12px 25px; }
+      .php-video-grid .item { border: 1px solid #3e3e3e; background: #111; color: #fff; text-decoration: none; }
+      .php-video-grid .item img { width: 100%; aspect-ratio: 16/9; object-fit: cover; display: block; }
+      .php-video-grid .meta { padding: 8px; }
+      .php-video-grid .meta strong { color: #ccff00; display: block; margin-bottom: 4px; }
+      .php-player-wrap { margin: 0 25px 15px 25px; }
+      .php-player-wrap iframe { width: 100%; aspect-ratio: 16/9; border: 1px solid #555; }
+      .php-section-text { margin: 0 25px 15px 25px; color: #fff; }
+      .php-widget-box { margin: 0 12px 10px 12px; border: 1px solid #3a3a3a; background: rgba(0,0,0,.28); padding: 8px; }
+      .php-widget-box h4 { margin: 0 0 8px 0; color: #ccff00; font-size: 18px; }
+      .php-widget-row { border: 1px solid #2e2e2e; background: #111; padding: 6px 8px; margin-bottom: 6px; }
+      .php-widget-row b { display:block; color:#f3f3f3; font-size: 13px; margin-bottom: 2px; }
+      .php-widget-row small { display:block; color:#bfc4cc; font-size:11px; }
+      .php-widget-links { display:flex; gap:8px; flex-wrap:wrap; }
+      .php-social-link { display:inline-block; border:1px solid #4a4a4a; background:#171717; color:#fff; padding:4px 8px; text-decoration:none; font-size:11px; }
+      .php-social-link:hover { border-color:#ccff00; color:#ccff00; }
+    </style>
+  <?php else: ?>
+    <link rel="stylesheet" href="<?= h(app_url('assets/style.css')) ?>">
+  <?php endif; ?>
+</head>
+<body class="<?= $activeTemplate === 'black_media' ? 'black-media-theme' : '' ?> template-<?= h($activeTemplate) ?>">
+<?php if ($activeTemplate === 'black_media'): ?>
+<div id="templatemo_left_side_menu">
+  <h3>Menu</h3>
+  <ul>
+    <?php foreach ($menu as $m): $id=(string)($m['id'] ?? ''); $url = $baseIndexUrl . '?menu=' . urlencode($id); ?>
+      <li><a href="<?= h($url) ?>" class="<?= $id === (string)($activeMenu['id'] ?? '') ? 'current' : '' ?>"><?= h((string)($m['label'] ?? 'Sekcja')) ?></a></li>
+    <?php endforeach; ?>
+  </ul>
+</div>
+
+<div id="templatemo_background_section_top">
+  <div class="templatemo_container">
+    <div id="templatemo_header">
+      <div id="templatemo_logo_section">
+        <h1><?= h($logoTitle) ?></h1>
+        <h2><?= h($logoSubtitle) ?></h2>
+      </div>
+      <div id="templatemo_search_box">
+        <a class="admin-btn" href="<?= h(app_url($user ? 'dashboard/index.php' : 'login.php')) ?>">ADMIN</a>
+      </div>
+    </div>
+
+    <div id="templatemo_menu_panel">
+      <div id="templatemo_menu_section">
+        <ul>
+          <?php foreach ($menu as $m): $id=(string)($m['id'] ?? ''); $url = $baseIndexUrl . '?menu=' . urlencode($id); ?>
+            <li><a href="<?= h($url) ?>" class="<?= $id === (string)($activeMenu['id'] ?? '') ? 'current' : '' ?>"><?= h((string)($m['label'] ?? 'Sekcja')) ?></a></li>
+          <?php endforeach; ?>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="templatemo_background_section_middle">
+  <div class="templatemo_container">
+    <div id="templatemo_left_section">
+      <div class="templatemo_post">
+        <div class="templatemo_post_top"><h1><?= h((string)($centerModule['config']['title'] ?? $homeTitle)) ?></h1></div>
+        <div class="templatemo_post_mid">
+          <?php if ($selectedVideo): ?>
+            <div class="php-player-wrap">
+              <iframe src="https://www.youtube.com/embed/<?= h((string)$selectedVideo['videoId']) ?>" allowfullscreen></iframe>
+            </div>
+          <?php endif; ?>
+
+          <p class="php-section-text"><?= h((string)($centerModule['config']['description'] ?? $homeSubtitle)) ?></p>
+
+          <?php
+            $ctype = (string)($centerModule['type'] ?? 'custom_text');
+            if ($ctype === 'widget_feed') {
+                $wid = (string)($centerModule['config']['widgetId'] ?? '');
+                $w = $widgetMap[$wid] ?? null;
+                if ($w && !empty($w['videos'])) {
+                    echo '<div class="php-video-grid">';
+                    foreach (array_slice($w['videos'], 0, 12) as $video) {
+                        $vurl = $baseIndexUrl . '?menu=' . urlencode((string)($activeMenu['id'] ?? '')) . '&widget=' . urlencode($wid) . '&video=' . urlencode((string)($video['videoId'] ?? ''));
+                        echo '<a class="item" href="' . h($vurl) . '"><img src="' . h((string)($video['thumbnail'] ?? '')) . '" alt=""><div class="meta"><strong>' . h((string)($video['title'] ?? 'Video')) . '</strong><span>' . h((string)($video['channelName'] ?? '')) . '</span></div></a>';
+                    }
+                    echo '</div>';
+                }
+            } elseif ($ctype === 'latest_videos' || $ctype === 'trending_videos') {
+                $list = module_videos($centerModule, $videos);
+                echo '<div class="php-video-grid">';
+                foreach ($list as $video) {
+                    $vurl = $baseIndexUrl . '?menu=' . urlencode((string)($activeMenu['id'] ?? '')) . '&video=' . urlencode((string)($video['videoId'] ?? ''));
+                    echo '<a class="item" href="' . h($vurl) . '"><img src="' . h((string)($video['thumbnail'] ?? '')) . '" alt=""><div class="meta"><strong>' . h((string)($video['title'] ?? 'Video')) . '</strong><span>' . h((string)($video['channelName'] ?? '')) . '</span></div></a>';
+                }
+                echo '</div>';
+            } elseif ($ctype === 'articles_list') {
+                echo '<div class="php-video-grid">';
+                foreach (array_slice($articles, 0, 12) as $a) {
+                    $thumb = (string)($a['thumbnail'] ?? app_url('themes/black_media/images/templatemo_ads.jpg'));
+                    echo '<div class="item"><img src="' . h($thumb) . '" alt=""><div class="meta"><strong>' . h((string)($a['title'] ?? 'Artykul')) . '</strong><span>' . h((string)($a['excerpt'] ?? '')) . '</span></div></div>';
+                }
+                echo '</div>';
+            }
+          ?>
+
+          <div class="clear"></div>
+        </div>
+        <div class="templatemo_post_bottom"><span class="post">Kliknij w menu po lewej i przeglądaj karty bez przewijania całej strony.</span></div>
+      </div>
+    </div>
+
+    <div id="templatemo_right_section">
+      <div class="templatemo_section_box">
+        <div class="templatemo_section_box_top"><h1>Polecane kafelki</h1></div>
+        <div class="templatemo_section_box_mid black-media-widget-grid big-tiles">
+          <?php foreach (array_slice($rightTiles, 0, 4) as $w): $prev = pick_preview($w); $url = $baseIndexUrl . '?menu=' . urlencode((string)($activeMenu['id'] ?? '')) . '&widget=' . urlencode((string)($w['id'] ?? '')); ?>
+            <a class="black-media-widget-card" href="<?= h($url) ?>">
+              <img src="<?= h((string)$prev['image']) ?>" alt="">
+              <strong><?= h((string)($w['title'] ?? 'Widget')) ?></strong>
+              <span><?= h((string)($prev['subtitle'] ?? '')) ?></span>
+            </a>
+          <?php endforeach; ?>
+        </div>
+        <div class="templatemo_section_box_bottom"></div>
+      </div>
+
+      <div class="templatemo_section_box">
+        <div class="templatemo_section_box_top"><h1>Widgety i aktualnosci</h1></div>
+        <div class="templatemo_section_box_mid">
+          <?php $hasTrendsWidget = false; foreach ($rightPanel as $w): ?>
+            <div class="php-widget-box">
+              <h4><?= h((string)($w['title'] ?? 'Widget')) ?></h4>
+              <?php if (($w['type'] ?? '') === 'communityTrends'): $hasTrendsWidget = true; ?>
+                <?php $trends = array_slice((array)($w['trends'] ?? []), 0, 5); ?>
+                <?php if (!$trends): $trends = compute_trends_fallback($analytics, 5); endif; ?>
+                <?php if ($trends): ?>
+                  <?php foreach ($trends as $i => $t): ?>
+                    <div class="php-widget-row">
+                      <b><?= h((string)(($i + 1) . '. ' . ($t['label'] ?? 'Element'))) ?></b>
+                      <small><?= h((string)(($t['clicks'] ?? 0) . ' klikniec • ' . ($t['contentType'] ?? 'content'))) ?></small>
+                      <?php if (!empty($t['lastActivity'])): ?><small>Ostatnia aktywnosc: <?= h((string)$t['lastActivity']) ?></small><?php endif; ?>
+                    </div>
+                  <?php endforeach; ?>
+                <?php else: ?>
+                  <div class="php-widget-row"><b>Brak danych trendow.</b><small>Zbierz klikniecia na stronie, aby uzupelnic statystyki.</small></div>
+                <?php endif; ?>
+              <?php elseif (($w['type'] ?? '') === 'discordFeed'): ?>
+                <?php foreach (array_slice((array)($w['discordMessages'] ?? []), 0, 3) as $d): ?>
+                  <div class="php-widget-row"><b><?= h((string)($d['authorName'] ?? 'Discord')) ?></b><small><?= h((string)($d['messageContent'] ?? $d['message'] ?? '')) ?></small></div>
+                <?php endforeach; ?>
+              <?php else: ?>
+                <div class="php-widget-row"><b>Widget aktywny</b><small><?= h((string)($w['description'] ?? '')) ?></small></div>
+              <?php endif; ?>
+            </div>
+          <?php endforeach; ?>
+
+
+          <?php if (!$hasTrendsWidget): ?>
+            <?php $fallbackTrends = compute_trends_fallback($analytics, 5); ?>
+            <div class="php-widget-box">
+              <h4>Najczesciej ogladane</h4>
+              <?php if ($fallbackTrends): ?>
+                <?php foreach ($fallbackTrends as $i => $t): ?>
+                  <div class="php-widget-row">
+                    <b><?= h((string)(($i + 1) . '. ' . ($t['label'] ?? 'Element'))) ?></b>
+                    <small><?= h((string)(($t['clicks'] ?? 0) . ' klikniec • ' . ($t['contentType'] ?? 'content'))) ?></small>
+                    <?php if (!empty($t['lastActivity'])): ?><small>Ostatnia aktywnosc: <?= h((string)$t['lastActivity']) ?></small><?php endif; ?>
+                  </div>
+                <?php endforeach; ?>
+              <?php else: ?>
+                <div class="php-widget-row"><b>Brak danych trendow.</b><small>Zbierz klikniecia na stronie, aby uzupelnic statystyki.</small></div>
+              <?php endif; ?>
+            </div>
+          <?php endif; ?>
+
+          <?php if ($showSocialInIndex): ?>
+            <div class="php-widget-box">
+              <h4>Social media</h4>
+              <?php if ($facebookUrl !== '' || $instagramUrl !== ''): ?>
+                <div class="php-widget-links">
+                  <?php if ($facebookUrl !== ''): ?><a class="php-social-link" href="<?= h($facebookUrl) ?>" target="_blank" rel="noopener noreferrer">Facebook</a><?php endif; ?>
+                  <?php if ($instagramUrl !== ''): ?><a class="php-social-link" href="<?= h($instagramUrl) ?>" target="_blank" rel="noopener noreferrer">Instagram</a><?php endif; ?>
+                </div>
+              <?php else: ?>
+                <div class="php-widget-row"><b>Brak linkow social.</b><small>Ustaw Facebook/Instagram w panelu admina -> Social.</small></div>
+              <?php endif; ?>
+              <?php if ($socialMode === 'api'): ?>
+                <div class="php-widget-row"><small>Tryb API wlaczony (Meta Integracje).</small></div>
+              <?php endif; ?>
+            </div>
+          <?php endif; ?>
+        </div>
+        <div class="templatemo_section_box_bottom"></div>
+      </div>
+    </div>
+
+    <div class="clear"></div>
+  </div>
+</div>
+
+<div id="templatemo_bottom_panel">
+  <div id="templatemo_bottom_section">
+    <div class="templatemo_bottom_section_box"><div class="top">Nawigacja</div><div class="body"><ul><?php foreach ($menu as $m): ?><li><?= h((string)($m['label'] ?? 'Sekcja')) ?></li><?php endforeach; ?></ul></div></div>
+    <div class="templatemo_bottom_section_box"><div class="top">Centrum</div><div class="body"><p><?= h($homeTitle) ?></p><p><?= h($homeSubtitle) ?></p></div></div>
+    <div class="templatemo_bottom_section_box"><div class="top">Panel</div><div class="body"><p>Projekt podlaczony do modulow dynamicznych.</p><p><a href="<?= h(app_url('dashboard/index.php')) ?>">Przejdz do panelu admina</a></p></div></div>
+    <div id="templatemo_footer_section">Copyright © <?= date('Y') ?> <?= h($siteName) ?></div>
+  </div>
+</div>
+
+<?php else: ?>
+<div class="page">
+  <header class="top">
+    <div class="brand">
+      <?php if ($logoPath !== ''): ?><img src="<?= h($logoPath) ?>" alt="logo"><?php endif; ?>
+      <div><h1><?= h($logoTitle) ?></h1><p><?= h($logoSubtitle) ?></p></div>
+    </div>
+    <div class="actions">
+      <?php if ($user): ?>
+        <a class="btn" href="<?= h(app_url('dashboard/index.php')) ?>">Panel admina</a>
+        <a class="btn" href="<?= h(app_url('logout.php')) ?>">Wyloguj</a>
+      <?php else: ?>
+        <a class="btn primary" href="<?= h(app_url('login.php')) ?>">Panel admina</a>
+      <?php endif; ?>
+    </div>
+  </header>
+  <div class="layout">
+    <aside class="col left"><div class="hd">Menu</div><div class="menu-list"><?php foreach ($menu as $m): $id=(string)($m['id'] ?? ''); $url = $baseIndexUrl . '?menu=' . urlencode($id); ?><a class="menu-btn <?= $id === ($activeMenu['id'] ?? '') ? 'active' : '' ?>" href="<?= h($url) ?>"><?= h((string)($m['label'] ?? 'Sekcja')) ?></a><?php endforeach; ?></div></aside>
+    <main class="col center"><div class="center-wrap"><div class="hero"><h2><?= h((string)($centerModule['config']['title'] ?? $homeTitle)) ?></h2><p><?= h((string)($centerModule['config']['description'] ?? $homeSubtitle)) ?></p></div></div></main>
+    <aside class="col right"><div class="right-wrap"><div class="hd" style="margin:-12px -12px 10px -12px;">Polecane kafelki</div></div></aside>
+  </div>
+</div>
+<?php endif; ?>
+</body>
+</html>
+
+
+
+
+
+
